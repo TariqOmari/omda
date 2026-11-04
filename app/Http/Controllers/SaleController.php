@@ -5,15 +5,11 @@ namespace App\Http\Controllers;
 use App\Models\Customer;
 use App\Models\Product;
 use App\Models\Sale;
-use App\Models\SaleInvoice;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
 class SaleController extends Controller
 {
-    /* =========================================================
-     | INDEX — GET /api/sales
-     * ========================================================= */
     public function index(Request $request)
     {
         $query = Sale::with(['customer', 'product']);
@@ -31,48 +27,16 @@ class SaleController extends Controller
             $query->where('customer_id', $request->customer_id);
         }
 
-        if ($request->input('customer_id') === 'null'
-            || $request->boolean('without_customer')) {
-            $query->whereNull('customer_id');
-        }
-
-        if ($request->filled('product_id')) {
-            $query->where('product_id', $request->product_id);
-        }
-
-        if ($request->filled('payment_type')) {
-            $query->where('payment_type', $request->payment_type);
-        }
-
-        if ($request->filled('currency')) {
-            $query->where('currency', $request->currency);
-        }
-
-        if ($request->filled('from')) {
-            $query->where('sale_date', '>=', $request->from);
-        }
-
-        if ($request->filled('to')) {
-            $query->where('sale_date', '<=', $request->to);
-        }
-
         return $query->latest()->get();
     }
 
-    /* =========================================================
-     | SHOW — GET /api/sales/{id}
-     * ========================================================= */
     public function show(Sale $sale)
     {
         return $sale->load(['customer', 'product']);
     }
 
-    /* =========================================================
-     | STORE — POST /api/sales
-     * ========================================================= */
     public function store(Request $request)
     {
-        // 👇 convert empty supplier/customer to null before validation
         if ($request->input('customer_id') === '') {
             $request->merge(['customer_id' => null]);
         }
@@ -80,17 +44,13 @@ class SaleController extends Controller
         $data = $request->validate([
             'customer_id'   => 'nullable|exists:customers,id',
             'product_id'    => 'required|exists:products,id',
-
             'sale_unit'     => 'required|in:module,sub_module,sub_sub_module',
             'qty_sold'      => 'required|integer|min:1',
-
             'unit_price'    => 'required|numeric|min:0',
             'currency'      => 'required|in:AFN,USD',
             'exchange_rate' => 'required|numeric|min:0.0001',
-
             'payment_type'  => 'required|in:cash,loan_full,loan_partial',
             'paid_amount'   => 'nullable|numeric|min:0',
-
             'sale_date'     => 'nullable|string|max:20',
             'note'          => 'nullable|string',
         ]);
@@ -98,17 +58,9 @@ class SaleController extends Controller
         $product  = Product::with('supplier')->findOrFail($data['product_id']);
         $customer = !empty($data['customer_id']) ? Customer::find($data['customer_id']) : null;
 
-        // 1) بررسی موجودی
         $this->checkStock($product, $data['sale_unit'], $data['qty_sold']);
+        $deduction = $this->calculateDeduction($product, $data['sale_unit'], $data['qty_sold']);
 
-        // 2) تبدیل qty به قطعه
-        $deduction = $this->calculateDeduction(
-            $product,
-            $data['sale_unit'],
-            $data['qty_sold']
-        );
-
-        // 3) قیمت
         $qty        = $data['qty_sold'];
         $unitPrice  = (float) $data['unit_price'];
         $totalPrice = round($qty * $unitPrice, 2);
@@ -118,107 +70,77 @@ class SaleController extends Controller
 
         $totalConv = Product::convertCurrency($totalPrice, $curr, $rate);
 
-        // 4) پرداخت
         switch ($data['payment_type']) {
-            case 'loan_full':
-                $paid = 0;
-                break;
-            case 'loan_partial':
-                $paid = max(0, min((float) ($data['paid_amount'] ?? 0), $totalPrice));
-                break;
-            case 'cash':
-            default:
-                $paid = $totalPrice;
+            case 'loan_full': $paid = 0; break;
+            case 'loan_partial': $paid = max(0, min((float) ($data['paid_amount'] ?? 0), $totalPrice)); break;
+            case 'cash': default: $paid = $totalPrice;
         }
         $remaining = round($totalPrice - $paid, 2);
 
         $paidConv      = Product::convertCurrency($paid, $curr, $rate);
         $remainingConv = Product::convertCurrency($remaining, $curr, $rate);
 
-        // 5) هزینه خرید
         $costPrice = $this->calculateCost($product, $deduction);
-
-        // 6) سود
         $profit = round($totalPrice - $costPrice, 2);
 
-        // 7) نام واحد فروش
         $saleUnitName = match ($data['sale_unit']) {
             'module'         => $product->module_name,
             'sub_module'     => $product->sub_module_name,
             'sub_sub_module' => $product->sub_sub_module_name,
         };
 
-        // 8) ثبت اتمیک
         $sale = DB::transaction(function () use (
             $product, $customer, $data, $deduction,
             $saleUnitName, $totalPrice, $totalConv, $curr, $rate,
             $paid, $paidConv, $remaining, $remainingConv,
             $costPrice, $profit
         ) {
-            // کسر از موجودی
             $product->removePiecesFromStock($deduction['pieces_used']);
             $product->save();
 
             return Sale::create([
                 'invoice_number' => Sale::generateInvoiceNumber(),
                 'sale_date'      => $data['sale_date'] ?? null,
-
                 'customer_id'   => $customer?->id,
-                'customer_name' => $customer
-                    ? trim("{$customer->name} {$customer->lastname}")
-                    : 'مشتری نقدی',
-
+                'customer_name' => $customer ? trim("{$customer->name} {$customer->lastname}") : 'مشتری نقدی',
                 'product_id'    => $product->id,
                 'product_name'  => $product->name,
-
                 'sale_unit'      => $data['sale_unit'],
                 'sale_unit_name' => $saleUnitName,
                 'qty_sold'       => $data['qty_sold'],
-
                 'cartons_used'    => $deduction['cartons_used'],
                 'sub_units_used'  => $deduction['sub_units_used'],
                 'pieces_used'     => $deduction['pieces_used'],
-
                 'module_name'         => $product->module_name,
                 'sub_module_name'     => $product->sub_module_name,
                 'sub_module_qty'      => $product->sub_module_qty ?: 1,
                 'sub_sub_module_name' => $product->sub_sub_module_name,
                 'sub_sub_module_qty'  => $product->sub_sub_module_qty ?: 1,
-
                 'unit_price'    => (float) $data['unit_price'],
                 'currency'      => $curr,
                 'exchange_rate' => $rate,
-
                 'total_price'      => $totalPrice,
                 'total_price_afn'  => $totalConv['afn'],
                 'total_price_usd'  => $totalConv['usd'],
-
                 'payment_type' => $data['payment_type'],
-
                 'paid_amount'          => $paid,
                 'paid_amount_afn'      => $paidConv['afn'],
                 'paid_amount_usd'      => $paidConv['usd'],
-
                 'remaining_amount'     => $remaining,
                 'remaining_amount_afn' => $remainingConv['afn'],
                 'remaining_amount_usd' => $remainingConv['usd'],
-
                 'cost_price' => $costPrice,
                 'profit'     => $profit,
-
                 'note' => $data['note'] ?? null,
             ]);
         });
 
-        // ✅ ساخت فاکتور فروش
-        SaleInvoice::createFromSale($sale);
+        // ❌ REMOVED: SaleInvoice::createFromSale($sale); 
+        // The frontend will now create the combined invoice using storeMulti.
 
         return response()->json($sale->load(['customer', 'product']), 201);
     }
 
-    /* =========================================================
-     | DESTROY — DELETE /api/sales/{id}
-     * ========================================================= */
     public function destroy(Sale $sale)
     {
         DB::transaction(function () use ($sale) {
@@ -226,16 +148,12 @@ class SaleController extends Controller
                 $sale->product->addPiecesToStock((int) $sale->pieces_used);
                 $sale->product->save();
             }
-
             $sale->delete();
         });
 
         return response()->json(['message' => 'Sale deleted']);
     }
 
-    /* =========================================================
-     | PAY — POST /api/sales/{id}/pay
-     * ========================================================= */
     public function pay(Request $request, Sale $sale)
     {
         $data = $request->validate([
@@ -248,17 +166,9 @@ class SaleController extends Controller
 
         $sale->applyPayment((float) $data['amount']);
 
-        $invoice = SaleInvoice::where('sale_id', $sale->id)->first();
-        if ($invoice) {
-            $invoice->syncFromSale($sale->fresh());
-        }
-
         return response()->json($sale->fresh()->load(['customer', 'product']));
     }
 
-    /* =========================================================
-     | PREVIEW — POST /api/sales/preview
-     * ========================================================= */
     public function preview(Request $request)
     {
         $data = $request->validate([
@@ -322,37 +232,21 @@ class SaleController extends Controller
         ]);
     }
 
-    /* =========================================================
-     | HELPERS
-     * ========================================================= */
-
     private function calculateDeduction(Product $product, string $unit, int $qty): array
     {
         $perCarton = $product->cansPerCarton();
         $perCan    = $product->piecesPerCan();
 
         switch ($unit) {
-            case 'module':
-                $pieces = $qty * $perCarton * $perCan;
-                break;
-
-            case 'sub_module':
-                $pieces = $product->sub_sub_module_name
-                    ? $qty * $perCan
-                    : $qty;
-                break;
-
-            case 'sub_sub_module':
-            default:
-                $pieces = $qty;
+            case 'module': $pieces = $qty * $perCarton * $perCan; break;
+            case 'sub_module': $pieces = $product->sub_sub_module_name ? $qty * $perCan : $qty; break;
+            case 'sub_sub_module': default: $pieces = $qty;
         }
 
         $cartonsUsed = intdiv($pieces, $perCarton * $perCan);
         $remainder   = $pieces % ($perCarton * $perCan);
 
-        $cansUsed = $product->sub_sub_module_name
-            ? intdiv($remainder, $perCan)
-            : $remainder;
+        $cansUsed = $product->sub_sub_module_name ? intdiv($remainder, $perCan) : $remainder;
 
         return [
             'cartons_used'   => $cartonsUsed,
@@ -364,7 +258,6 @@ class SaleController extends Controller
     private function checkStock(Product $product, string $unit, int $qty): void
     {
         $deduct = $this->calculateDeduction($product, $unit, $qty);
-
         $availablePieces = $product->totalPiecesInStock();
 
         if ($deduct['pieces_used'] > $availablePieces) {

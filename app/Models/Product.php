@@ -19,6 +19,8 @@ class Product extends Model
         'payment_type',
         'production_date', 'expiry_date', 'stock_entry_date',
         
+        // NEW WARNING FIELDS
+        'low_stock_warning', 'high_stock_warning',
     ];
 
     protected $casts = [
@@ -38,6 +40,10 @@ class Product extends Model
         'remaining_amount'            => 'float',
         'remaining_amount_afn'        => 'float',
         'remaining_amount_usd'        => 'float',
+        
+        // NEW WARNING CASTS
+        'low_stock_warning'           => 'integer',
+        'high_stock_warning'          => 'integer',
     ];
 
     protected $appends = ['photo_url'];

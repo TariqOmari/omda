@@ -2,71 +2,49 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Product;
 use App\Models\ProductPurchaseBill;
 use Illuminate\Http\Request;
 
 class ProductPurchaseBillController extends Controller
 {
-    /* =========================================================
-     | INDEX — GET /api/product-purchase-bills
-     * ========================================================= */
     public function index(Request $request)
     {
-        $q = ProductPurchaseBill::with(['product', 'supplier']);
+        $bills = ProductPurchaseBill::latest()->get();
 
-        if ($request->filled('search')) {
-            $s = $request->search;
-            $q->where(function ($x) use ($s) {
-                $x->where('bill_number', 'like', "%{$s}%")
-                  ->orWhere('product_name', 'like', "%{$s}%")
-                  ->orWhere('supplier_name', 'like', "%{$s}%");
-            });
-        }
+        return $bills->map(function ($bill) {
+            $arr = $bill->toArray();
+            
+            // Attach products from product_ids
+            $arr['products'] = Product::with('supplier')
+                ->whereIn('id', $bill->product_ids ?? [])
+                ->get();
+                
+            $firstProduct = $arr['products']->first();
+            $arr['supplier_name'] = $firstProduct?->supplier?->supplier_name;
 
-        if ($request->filled('supplier_id')) {
-            $q->where('supplier_id', $request->supplier_id);
-        }
-
-        // ✅ NEW: filter bills whose product has NO supplier
-        if ($request->input('supplier_id') === 'null'
-            || $request->boolean('without_supplier')) {
-            $q->whereNull('supplier_id');
-        }
-
-        if ($request->filled('payment_type')) {
-            $q->where('payment_type', $request->payment_type);
-        }
-
-        if ($request->filled('currency')) {
-            $q->where('currency', $request->currency);
-        }
-
-        if ($request->filled('from')) {
-            $q->whereDate('created_at', '>=', $request->from);
-        }
-
-        if ($request->filled('to')) {
-            $q->whereDate('created_at', '<=', $request->to);
-        }
-
-        return $q->latest()->get();
+            return $arr;
+        });
     }
 
-    /* =========================================================
-     | SHOW — GET /api/product-purchase-bills/{bill}
-     * ========================================================= */
     public function show(ProductPurchaseBill $bill)
     {
-        return $bill->load(['product', 'supplier']);
+        $arr = $bill->toArray();
+        
+        // THIS IS THE MISSING PART: Attach the products!
+        $arr['products'] = Product::with('supplier')
+            ->whereIn('id', $bill->product_ids ?? [])
+            ->get();
+            
+        $firstProduct = $arr['products']->first();
+        $arr['supplier_name'] = $firstProduct?->supplier?->supplier_name;
+
+        return response()->json($arr);
     }
 
-    /* =========================================================
-     | DESTROY — DELETE /api/product-purchase-bills/{bill}
-     * ========================================================= */
     public function destroy(ProductPurchaseBill $bill)
     {
         $bill->delete();
-
         return response()->json(['message' => 'Bill deleted']);
     }
 }

@@ -100,3 +100,9 @@ Route::get('loans/suppliers',              [LoanController::class, 'supplierLoan
 Route::get('loans/suppliers/{supplier}',   [LoanController::class, 'singleSupplierLoans']);
 
 Route::post('/products/{product}/add-stock', [ProductController::class, 'addStock']);
+
+Route::post('/product-purchase-bills/multi', [ProductController::class, 'storeMulti']);
+
+
+
+Route::post('/sale-invoices/multi', [SaleInvoiceController::class, 'storeMulti']);
