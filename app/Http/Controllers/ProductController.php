@@ -8,7 +8,6 @@ use App\Models\ProductPurchaseBill;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
-use Illuminate\Validation\Rule;
 
 class ProductController extends Controller
 {
@@ -30,8 +29,7 @@ class ProductController extends Controller
             $query->where('supplier_id', $request->supplier_id);
         }
 
-        if ($request->input('supplier_id') === 'null'
-            || $request->boolean('without_supplier')) {
+        if ($request->input('supplier_id') === 'null' || $request->boolean('without_supplier')) {
             $query->whereNull('supplier_id');
         }
 
@@ -53,18 +51,25 @@ class ProductController extends Controller
     }
 
     /* HELPER: Sync Dynamic Stock */
-    private function syncProductStock(Product $product, $addModule = 0, $addSubModule = 0, $addSubSubModule = 0)
+    private function syncProductStock(Product $product, int $addModule = 0, int $addSubModule = 0, int $addSubSubModule = 0)
     {
         $stock = ProductStock::firstOrCreate(['product_id' => $product->id]);
+        $stock->setRelation('product', $product); 
         
-        $stock->module_stock         += $addModule;
-        $stock->sub_module_stock     += $addSubModule;
-        $stock->sub_sub_module_stock += $addSubSubModule;
+        // The request may include lower-unit equivalents of the entered carton quantity.
+        // Use the highest supplied unit so those equivalents are not counted again.
+        if ($addModule > 0) {
+            $piecesAdded = $addModule * $product->piecesPerCarton();
+        } elseif ($addSubModule > 0) {
+            $piecesAdded = $addSubModule * $product->piecesPerCan();
+        } else {
+            $piecesAdded = $addSubSubModule;
+        }
+
+        $currentPieces = $stock->getCurrentPiecesCount(); // 👈 موجودی فعلی را دقیق میگیرد
+        $newPieces = $currentPieces + $piecesAdded;       // 👈 خرید جدید را اضافه میکند
         
-        $stock->module_stock         = max(0, $stock->module_stock);
-        $stock->sub_module_stock     = max(0, $stock->sub_module_stock);
-        $stock->sub_sub_module_stock = max(0, $stock->sub_sub_module_stock);
-        
+        $stock->syncFromPieces($newPieces);
         $stock->save();
     }
 
@@ -94,8 +99,6 @@ class ProductController extends Controller
             'expiry_date'         => 'nullable|string|max:20',
             'low_stock_warning'   => 'nullable|integer|min:0',
             'high_stock_warning'  => 'nullable|integer|min:0',
-            
-            // 🚀 NEW SELLING PRICES
             'sell_price_module'         => 'nullable|numeric|min:0',
             'sell_price_sub_module'     => 'nullable|numeric|min:0',
             'sell_price_sub_sub_module' => 'nullable|numeric|min:0',
@@ -109,8 +112,7 @@ class ProductController extends Controller
         if ($data['price_mode'] === 'sub_module' && empty($data['sub_module_name'])) {
             return response()->json(['message' => 'sub_module_name لازم است'], 422);
         }
-        if ($data['price_mode'] === 'sub_sub_module' &&
-            (empty($data['sub_module_name']) || empty($data['sub_sub_module_name']))) {
+        if ($data['price_mode'] === 'sub_sub_module' && (empty($data['sub_module_name']) || empty($data['sub_sub_module_name']))) {
             return response()->json(['message' => 'sub_module_name و sub_sub_module_name لازم است'], 422);
         }
         if ($data['payment_type'] === 'loan_partial' && empty($data['paid_amount'])) {
@@ -131,14 +133,32 @@ class ProductController extends Controller
 
         $product = DB::transaction(function () use ($data, $qty, $payment) {
             $product = Product::create($data);
-            $product->applyFinalPrice($qty, $payment);
             
-            $this->syncProductStock(
-                $product, 
-                $qty, 
-                $product->sub_module_name ? $qty * $product->sub_module_qty : 0, 
-                $product->sub_sub_module_name ? $qty * $product->sub_module_qty * $product->sub_sub_module_qty : 0
-            );
+            $calc = $product->calculatePrice($qty);
+            $product->final_price = $calc['final_price'];
+            
+            $rate = (float) ($product->exchange_rate ?: 1);
+            $curr = strtoupper($product->currency ?: 'AFN');
+            $converted = Product::convertCurrency($product->final_price, $curr, $rate);
+            $product->final_price_afn = $converted['afn'];
+            $product->final_price_usd = $converted['usd'];
+
+            $type = $payment['payment_type'] ?? 'cash';
+            if ($type === 'loan_full') { $product->paid_amount = 0; $product->remaining_amount = $product->final_price; }
+            elseif ($type === 'loan_partial') { $product->paid_amount = max(0, min((float)($payment['paid_amount'] ?? 0), $product->final_price)); $product->remaining_amount = round($product->final_price - $product->paid_amount, 2); }
+            else { $product->paid_amount = $product->final_price; $product->remaining_amount = 0; }
+            $product->payment_type = $type;
+            
+            $paidConv = Product::convertCurrency($product->paid_amount, $curr, $rate);
+            $remConv  = Product::convertCurrency($product->remaining_amount, $curr, $rate);
+            $product->paid_amount_afn = $paidConv['afn'];
+            $product->paid_amount_usd = $paidConv['usd'];
+            $product->remaining_amount_afn = $remConv['afn'];
+            $product->remaining_amount_usd = $remConv['usd'];
+            
+            $product->save();
+            
+            $this->syncProductStock($product, $qty);
             
             return $product;
         });
@@ -178,31 +198,23 @@ class ProductController extends Controller
             'category'            => 'sometimes|nullable|string|max:255',
             'barcode'             => 'sometimes|nullable|string|max:100|unique:products,barcode,' . $product->id,
             'photo'               => 'sometimes|nullable|image|mimes:jpg,jpeg,png,webp|max:2048',
-
             'module_name'         => 'sometimes|required|string|max:100',
             'sub_module_name'     => 'sometimes|nullable|string|max:100',
             'sub_module_qty'      => 'sometimes|nullable|integer|min:1',
             'sub_sub_module_name' => 'sometimes|nullable|string|max:100',
             'sub_sub_module_qty'  => 'sometimes|nullable|integer|min:1',
-
             'price_mode'          => 'sometimes|required|in:module,sub_module,sub_sub_module',
             'price'               => 'sometimes|required|numeric|min:0',
             'qty'                 => 'sometimes|integer|min:1',
             'stock_entry_date'    => 'sometimes|nullable|string|max:20',
-
             'currency'            => 'sometimes|required|in:AFN,USD',
             'exchange_rate'       => 'sometimes|required|numeric|min:0.0001',
-
             'payment_type'        => 'sometimes|required|in:cash,loan_full,loan_partial',
             'paid_amount'         => 'sometimes|nullable|numeric|min:0',
-
             'production_date'     => 'sometimes|nullable|string|max:20',
             'expiry_date'         => 'sometimes|nullable|string|max:20',
-            
             'low_stock_warning'   => 'sometimes|nullable|integer|min:0',
             'high_stock_warning'  => 'sometimes|nullable|integer|min:0',
-
-            // 🚀 NEW SELLING PRICES
             'sell_price_module'         => 'sometimes|nullable|numeric|min:0',
             'sell_price_sub_module'     => 'sometimes|nullable|numeric|min:0',
             'sell_price_sub_sub_module' => 'sometimes|nullable|numeric|min:0',
@@ -288,14 +300,10 @@ class ProductController extends Controller
             $product->remaining_amount_afn = $remainingConv['afn'];
             $product->remaining_amount_usd = $remainingConv['usd'];
 
-            $product->payment_type = $product->remaining_amount <= 0
-                ? 'cash'
-                : 'loan_partial';
-
+            $product->payment_type = $product->remaining_amount <= 0 ? 'cash' : 'loan_partial';
             $product->save();
 
             $product->refresh()->load('supplier');
-
             $bills = ProductPurchaseBill::whereJsonContains('product_ids', $product->id)->get();
             foreach ($bills as $bill) {
                 $bill->syncFromProduct($product);
@@ -436,7 +444,6 @@ class ProductController extends Controller
                 'low_stock_warning'  => (int) $p->low_stock_warning,
                 'high_stock_warning' => (int) $p->high_stock_warning,
 
-                // 🚀 NEW SELLING PRICES HERE
                 'sell_price_module'         => (float) $p->sell_price_module,
                 'sell_price_sub_module'     => (float) $p->sell_price_sub_module,
                 'sell_price_sub_sub_module' => $p->sub_sub_module_name ? (float) $p->sell_price_sub_sub_module : null,
@@ -465,25 +472,14 @@ class ProductController extends Controller
         }
 
         DB::transaction(function () use ($product, $addMain, $addSub, $addSub2, $data) {
-            if ($addMain > 0) {
-                $product->final_qty = (int) $product->final_qty + $addMain;
-            }
-            if ($addSub > 0 && $product->sub_module_name) {
-                $product->sub_module_final_qty = (int) $product->sub_module_final_qty + $addSub;
-            }
-            if ($addSub2 > 0 && $product->sub_sub_module_name) {
-                $product->sub_sub_module_final_qty = (int) $product->sub_sub_module_final_qty + $addSub2;
-            }
             if (!empty($data['stock_entry_date'])) {
                 $product->stock_entry_date = $data['stock_entry_date'];
+                $product->save();
             }
-
-            $product->save();
             
             $this->syncProductStock($product, $addMain, $addSub, $addSub2);
 
             $product->refresh()->load('supplier');
-
             $bills = ProductPurchaseBill::whereJsonContains('product_ids', $product->id)->get();
             foreach ($bills as $bill) {
                 $bill->syncFromProduct($product);
@@ -500,15 +496,12 @@ class ProductController extends Controller
             'add_module_qty'         => 'nullable|integer|min:0',
             'add_sub_module_qty'     => 'nullable|integer|min:0',
             'add_sub_sub_module_qty' => 'nullable|integer|min:0',
-
             'price'           => 'required|numeric|min:0',
             'price_mode'      => 'required|in:module,sub_module,sub_sub_module',
             'currency'        => 'required|in:AFN,USD',
             'exchange_rate'   => 'required|numeric|min:0.0001',
-
             'payment_type'    => 'required|in:cash,loan_full,loan_partial',
             'paid_amount'     => 'nullable|numeric|min:0',
-
             'stock_entry_date' => 'nullable|string|max:20',
             'production_date'  => 'nullable|string|max:20',
             'expiry_date'      => 'nullable|string|max:20',
@@ -534,21 +527,17 @@ class ProductController extends Controller
                 'add_module_qty'         => $addMain,
                 'add_sub_module_qty'     => $addSub,
                 'add_sub_sub_module_qty' => $addSub2,
-
                 'module_name'         => $product->module_name,
                 'sub_module_name'     => $product->sub_module_name,
                 'sub_sub_module_name' => $product->sub_sub_module_name,
                 'sub_module_qty'      => $product->sub_module_qty ?: 1,
                 'sub_sub_module_qty'  => $product->sub_sub_module_qty ?: 1,
                 'price_mode'          => $data['price_mode'],
-
                 'price'         => $data['price'],
                 'currency'      => $data['currency'],
                 'exchange_rate' => $data['exchange_rate'],
-
                 'payment_type' => $data['payment_type'],
                 'paid_amount'  => $data['paid_amount'] ?? 0,
-
                 'stock_entry_date' => $data['stock_entry_date'] ?? null,
                 'production_date'  => $data['production_date'] ?? null,
                 'expiry_date'      => $data['expiry_date'] ?? null,
@@ -557,24 +546,14 @@ class ProductController extends Controller
             $record->computeTotals();
             $record->save();
 
-            if ($addMain > 0) {
-                $product->final_qty = (int) $product->final_qty + $addMain;
-            }
-            if ($addSub > 0) {
-                $product->sub_module_final_qty = (int) $product->sub_module_final_qty + $addSub;
-            }
-            if ($addSub2 > 0) {
-                $product->sub_sub_module_final_qty = (int) $product->sub_sub_module_final_qty + $addSub2;
-            }
             if (!empty($data['stock_entry_date'])) {
                 $product->stock_entry_date = $data['stock_entry_date'];
+                $product->save();
             }
-            $product->save();
 
             $this->syncProductStock($product, $addMain, $addSub, $addSub2);
 
             $product->refresh()->load('supplier');
-
             $bills = ProductPurchaseBill::whereJsonContains('product_ids', $product->id)->get();
             foreach ($bills as $bill) {
                 $bill->syncFromProduct($product);
@@ -599,4 +578,9 @@ class ProductController extends Controller
             'records' => $records,
         ]);
     }
+
+
+
+   
+
 }

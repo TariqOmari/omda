@@ -60,10 +60,10 @@ class SaleController extends Controller
         $customer = !empty($data['customer_id']) ? Customer::find($data['customer_id']) : null;
         $stock    = ProductStock::firstOrCreate(['product_id' => $product->id]);
 
-        // 1. Verify Stock Availability dynamically
+        // 1. بررسی موجودی
         $this->checkStockAvailability($product, $stock, $data['sale_unit'], $data['qty_sold']);
 
-        // 2. Calculate Math and Deductions
+        // 2. محاسبات ریاضی
         $deduction = $this->calculateDeduction($product, $data['sale_unit'], $data['qty_sold']);
 
         $qty        = $data['qty_sold'];
@@ -100,28 +100,9 @@ class SaleController extends Controller
             $paid, $paidConv, $remaining, $remainingConv,
             $costPrice, $profit
         ) {
-            // 3. Deduct from the ProductStock table dynamically
-            $perCarton = $product->cansPerCarton();
-            $perCan    = $product->piecesPerCan();
-            $qtySold   = $data['qty_sold'];
-
-            if ($data['sale_unit'] === 'module') {
-                $stock->module_stock -= $qtySold;
-                if ($product->sub_module_name) $stock->sub_module_stock -= ($qtySold * $perCarton);
-                if ($product->sub_sub_module_name) $stock->sub_sub_module_stock -= ($qtySold * $perCarton * $perCan);
-            } 
-            elseif ($data['sale_unit'] === 'sub_module') {
-                $stock->sub_module_stock -= $qtySold;
-                if ($product->sub_sub_module_name) $stock->sub_sub_module_stock -= ($qtySold * $perCan);
-            } 
-            elseif ($data['sale_unit'] === 'sub_sub_module') {
-                $stock->sub_sub_module_stock -= $qtySold;
-            }
-
-            // Prevent negative stock
-            $stock->module_stock = max(0, $stock->module_stock);
-            $stock->sub_module_stock = max(0, $stock->sub_module_stock);
-            $stock->sub_sub_module_stock = max(0, $stock->sub_sub_module_stock);
+            // 3. 👈 کم کردن از موجودی کل (به صورت دانه)
+            $newPieces = $stock->sub_sub_module_stock - $deduction['pieces_used'];
+            $stock->syncFromPieces($newPieces);
             $stock->save();
 
             return Sale::create([
@@ -171,24 +152,11 @@ class SaleController extends Controller
                 $product = $sale->product;
                 $stock = ProductStock::firstOrCreate(['product_id' => $sale->product_id]);
                 
-                $perCarton = $product->cansPerCarton();
-                $perCan    = $product->piecesPerCan();
-                $qtySold   = $sale->qty_sold;
+                $deduction = $this->calculateDeduction($product, $sale->sale_unit, $sale->qty_sold);
 
-                // Add stock back to the exact unit sold
-                if ($sale->sale_unit === 'module') {
-                    $stock->module_stock += $qtySold;
-                    if ($product->sub_module_name) $stock->sub_module_stock += ($qtySold * $perCarton);
-                    if ($product->sub_sub_module_name) $stock->sub_sub_module_stock += ($qtySold * $perCarton * $perCan);
-                } 
-                elseif ($sale->sale_unit === 'sub_module') {
-                    $stock->sub_module_stock += $qtySold;
-                    if ($product->sub_sub_module_name) $stock->sub_sub_module_stock += ($qtySold * $perCan);
-                } 
-                elseif ($sale->sale_unit === 'sub_sub_module') {
-                    $stock->sub_sub_module_stock += $qtySold;
-                }
-                
+                // 👈 برگرداندن به موجودی کل (به صورت دانه)
+                $newPieces = $stock->sub_sub_module_stock + $deduction['pieces_used'];
+                $stock->syncFromPieces($newPieces);
                 $stock->save();
             }
             $sale->delete();
@@ -223,7 +191,6 @@ class SaleController extends Controller
         $product = Product::findOrFail($data['product_id']);
         $stock   = ProductStock::firstOrCreate(['product_id' => $product->id]);
 
-        // Check against the new dynamic stock
         $this->checkStockAvailability($product, $stock, $data['sale_unit'], $data['qty_sold']);
 
         $deduction = $this->calculateDeduction($product, $data['sale_unit'], $data['qty_sold']);
@@ -232,26 +199,12 @@ class SaleController extends Controller
         $currentSubStock    = $stock->sub_module_stock;
         $currentSubSubStock = $stock->sub_sub_module_stock;
 
-        $remainingModule = $currentModuleStock;
-        $remainingSub    = $currentSubStock;
-        $remainingSubSub = $currentSubSubStock;
-
-        $perCarton = $product->cansPerCarton();
-        $perCan    = $product->piecesPerCan();
-        $qtySold   = $data['qty_sold'];
-
-        if ($data['sale_unit'] === 'module') {
-            $remainingModule -= $qtySold;
-            if ($product->sub_module_name) $remainingSub -= ($qtySold * $perCarton);
-            if ($product->sub_sub_module_name) $remainingSubSub -= ($qtySold * $perCarton * $perCan);
-        } 
-        elseif ($data['sale_unit'] === 'sub_module') {
-            $remainingSub -= $qtySold;
-            if ($product->sub_sub_module_name) $remainingSubSub -= ($qtySold * $perCan);
-        } 
-        elseif ($data['sale_unit'] === 'sub_sub_module') {
-            $remainingSubSub -= $qtySold;
-        }
+        // شبیه‌سازی موجودی بعد از فروش
+        $tempStock = new ProductStock();
+        $tempStock->product_id = $product->id;
+        $tempStock->setRelation('product', $product);
+        
+        $tempStock->syncFromPieces($currentSubSubStock - $deduction['pieces_used']);
 
         return response()->json([
             'product' => [
@@ -276,23 +229,19 @@ class SaleController extends Controller
                 'sub_sub_module' => $currentSubSubStock,
             ],
             'remaining_stock' => [
-                'module'     => max(0, $remainingModule),
-                'sub_module' => max(0, $remainingSub),
-                'sub_sub_module' => max(0, $remainingSubSub),
+                'module'     => $tempStock->module_stock,
+                'sub_module' => $tempStock->sub_module_stock,
+                'sub_sub_module' => $tempStock->sub_sub_module_stock,
             ],
         ]);
     }
 
     private function checkStockAvailability(Product $product, ProductStock $stock, string $unit, int $qty): void
     {
-        if ($unit === 'module' && $stock->module_stock < $qty) {
-            abort(response()->json(['message' => "موجودی {$product->module_name} کافی نیست. موجودی فعلی: {$stock->module_stock}"], 422));
-        }
-        if ($unit === 'sub_module' && $stock->sub_module_stock < $qty) {
-            abort(response()->json(['message' => "موجودی {$product->sub_module_name} کافی نیست. موجودی فعلی: {$stock->sub_module_stock}"], 422));
-        }
-        if ($unit === 'sub_sub_module' && $stock->sub_sub_module_stock < $qty) {
-            abort(response()->json(['message' => "موجودی {$product->sub_sub_module_name} کافی نیست. موجودی فعلی: {$stock->sub_sub_module_stock}"], 422));
+        $deduction = $this->calculateDeduction($product, $unit, $qty);
+        
+        if ($stock->sub_sub_module_stock < $deduction['pieces_used']) {
+            abort(response()->json(['message' => "موجودی کافی نیست. موجودی فعلی: {$stock->sub_sub_module_stock} دانه"], 422));
         }
     }
 
