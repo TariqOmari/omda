@@ -106,3 +106,7 @@ Route::post('/product-purchase-bills/multi', [ProductController::class, 'storeMu
 
 
 Route::post('/sale-invoices/multi', [SaleInvoiceController::class, 'storeMulti']);
+
+// routes/api.php
+Route::post('/products/{product}/restock',   [ProductController::class, 'restock']);
+Route::get('/products/{product}/restocks',   [ProductController::class, 'restockHistory']);

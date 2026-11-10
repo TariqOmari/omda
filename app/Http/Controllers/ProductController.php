@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Product;
+use App\Models\ProductStock;
 use App\Models\ProductPurchaseBill;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -14,7 +15,7 @@ class ProductController extends Controller
     /* INDEX */
     public function index(Request $request)
     {
-        $query = Product::with('supplier');
+        $query = Product::with(['supplier', 'currentStock', 'restockRecords']);
 
         if ($request->filled('search')) {
             $s = $request->search;
@@ -48,7 +49,23 @@ class ProductController extends Controller
     /* SHOW */
     public function show(Product $product)
     {
-        return $product->load('supplier');
+        return $product->load(['supplier', 'currentStock']);
+    }
+
+    /* HELPER: Sync Dynamic Stock */
+    private function syncProductStock(Product $product, $addModule = 0, $addSubModule = 0, $addSubSubModule = 0)
+    {
+        $stock = ProductStock::firstOrCreate(['product_id' => $product->id]);
+        
+        $stock->module_stock         += $addModule;
+        $stock->sub_module_stock     += $addSubModule;
+        $stock->sub_sub_module_stock += $addSubSubModule;
+        
+        $stock->module_stock         = max(0, $stock->module_stock);
+        $stock->sub_module_stock     = max(0, $stock->sub_module_stock);
+        $stock->sub_sub_module_stock = max(0, $stock->sub_sub_module_stock);
+        
+        $stock->save();
     }
 
     /* STORE — single product */
@@ -77,6 +94,11 @@ class ProductController extends Controller
             'expiry_date'         => 'nullable|string|max:20',
             'low_stock_warning'   => 'nullable|integer|min:0',
             'high_stock_warning'  => 'nullable|integer|min:0',
+            
+            // 🚀 NEW SELLING PRICES
+            'sell_price_module'         => 'nullable|numeric|min:0',
+            'sell_price_sub_module'     => 'nullable|numeric|min:0',
+            'sell_price_sub_sub_module' => 'nullable|numeric|min:0',
         ]);
 
         $data['sub_module_qty']     = $data['sub_module_qty']     ?? 1;
@@ -110,15 +132,21 @@ class ProductController extends Controller
         $product = DB::transaction(function () use ($data, $qty, $payment) {
             $product = Product::create($data);
             $product->applyFinalPrice($qty, $payment);
+            
+            $this->syncProductStock(
+                $product, 
+                $qty, 
+                $product->sub_module_name ? $qty * $product->sub_module_qty : 0, 
+                $product->sub_sub_module_name ? $qty * $product->sub_module_qty * $product->sub_sub_module_qty : 0
+            );
+            
             return $product;
         });
 
-        return response()->json($product->fresh()->load('supplier'), 201);
+        return response()->json($product->fresh()->load(['supplier', 'currentStock']), 201);
     }
 
-    /* =========================================================
-     | STORE MULTI — POST /api/product-purchase-bills/multi
-     * ========================================================= */
+    /* STORE MULTI */
     public function storeMulti(Request $request)
     {
         $data = $request->validate([
@@ -134,7 +162,7 @@ class ProductController extends Controller
         ]);
 
         $arr = $bill->toArray();
-        $arr['products'] = Product::with('supplier')
+        $arr['products'] = Product::with(['supplier', 'currentStock'])
             ->whereIn('id', $bill->product_ids)
             ->get();
 
@@ -173,6 +201,11 @@ class ProductController extends Controller
             
             'low_stock_warning'   => 'sometimes|nullable|integer|min:0',
             'high_stock_warning'  => 'sometimes|nullable|integer|min:0',
+
+            // 🚀 NEW SELLING PRICES
+            'sell_price_module'         => 'sometimes|nullable|numeric|min:0',
+            'sell_price_sub_module'     => 'sometimes|nullable|numeric|min:0',
+            'sell_price_sub_sub_module' => 'sometimes|nullable|numeric|min:0',
         ]);
 
         if ($request->hasFile('photo')) {
@@ -214,7 +247,7 @@ class ProductController extends Controller
             }
         });
 
-        return $product->fresh()->load('supplier');
+        return $product->fresh()->load(['supplier', 'currentStock']);
     }
 
     /* DESTROY */
@@ -225,65 +258,6 @@ class ProductController extends Controller
         }
         $product->delete();
         return response()->json(['message' => 'Product deleted']);
-    }
-
-    /* RESTOCK — re-add stock for an existing product AND create a new purchase bill */
-    public function restock(Request $request, Product $product)
-    {
-        $data = $request->validate([
-            'qty'                => 'required|integer|min:1',
-            'paid_amount'        => 'nullable|numeric|min:0',
-            'payment_type'       => 'sometimes|in:cash,loan_full,loan_partial',
-            'exchange_rate'      => 'sometimes|numeric|min:0.0001',
-            'stock_entry_date'   => 'nullable|string|max:20',
-        ]);
-
-        return DB::transaction(function () use ($product, $data) {
-            $qty = (int) $data['qty'];
-
-            $perCarton = max(1, (int) ($product->sub_module_qty ?: 1));
-            $perCan    = max(1, (int) ($product->sub_sub_module_qty ?: 1));
-
-            $product->final_qty = (int) $product->final_qty + $qty;
-            if ($product->sub_module_name) {
-                $product->sub_module_final_qty =
-                    (int) $product->sub_module_final_qty + ($qty * $perCarton);
-            }
-            if ($product->sub_sub_module_name) {
-                $product->sub_sub_module_final_qty =
-                    (int) $product->sub_sub_module_final_qty + ($qty * $perCarton * $perCan);
-            }
-            if (!empty($data['stock_entry_date'])) {
-                $product->stock_entry_date = $data['stock_entry_date'];
-            }
-
-            if (isset($data['payment_type'])) {
-                $product->payment_type = $data['payment_type'];
-            }
-            if (isset($data['exchange_rate'])) {
-                $product->exchange_rate = $data['exchange_rate'];
-            }
-
-            $payment = [
-                'payment_type' => $product->payment_type,
-                'paid_amount'  => $data['paid_amount'] ?? $product->paid_amount,
-            ];
-            $product->applyFinalPrice((int) $product->final_qty, $payment);
-            $product->save();
-
-            $bill = ProductPurchaseBill::create([
-                'bill_number' => ProductPurchaseBill::generateBillNumber(),
-                'product_ids' => [$product->id],
-                'supplier_id' => $product->supplier_id,
-            ]);
-
-            return response()->json([
-                'product' => $product->fresh()->load('supplier'),
-                'bill'    => $bill->load(['products' => fn($q) =>
-                    $q->whereIn('id', [$product->id])
-                ]),
-            ], 200);
-        });
     }
 
     /* PAY */
@@ -328,7 +302,7 @@ class ProductController extends Controller
             }
         });
 
-        return response()->json($product->fresh()->load('supplier'));
+        return response()->json($product->fresh()->load(['supplier', 'currentStock']));
     }
 
     /* CALCULATE */
@@ -366,7 +340,7 @@ class ProductController extends Controller
             'barcode' => 'required|string',
         ]);
 
-        $product = Product::with('supplier')
+        $product = Product::with(['supplier', 'currentStock'])
             ->where('barcode', $data['barcode'])
             ->first();
 
@@ -380,24 +354,22 @@ class ProductController extends Controller
     /* STOCK */
     public function stock(Product $product)
     {
-        $cartons = (int) $product->final_qty;
-        $cans    = (int) $product->sub_module_final_qty;
-        $pieces  = (int) $product->sub_sub_module_final_qty;
+        $stock = $product->currentStock;
 
         return response()->json([
             'product' => ['id' => $product->id, 'name' => $product->name],
             'units' => [
                 'module' => [
                     'name'  => $product->module_name,
-                    'stock' => $cartons,
+                    'stock' => $stock->module_stock ?? 0,
                 ],
                 'sub_module' => $product->sub_module_name ? [
                     'name'  => $product->sub_module_name,
-                    'stock' => $cans,
+                    'stock' => $stock->sub_module_stock ?? 0,
                 ] : null,
                 'sub_sub_module' => $product->sub_sub_module_name ? [
                     'name'  => $product->sub_sub_module_name,
-                    'stock' => $pieces,
+                    'stock' => $stock->sub_sub_module_stock ?? 0,
                 ] : null,
             ],
         ]);
@@ -406,12 +378,13 @@ class ProductController extends Controller
     /* STOCK ALL */
     public function stockAll()
     {
-        $products = Product::with('supplier')->get();
+        $products = Product::with(['supplier', 'currentStock'])->get();
 
         $result = $products->map(function ($p) {
-            $cartons = (int) $p->final_qty;
-            $cans    = (int) $p->sub_module_final_qty;
-            $pieces  = (int) $p->sub_sub_module_final_qty;
+            $stock = $p->currentStock;
+            $moduleStock = $stock->module_stock ?? 0;
+            $subStock    = $stock->sub_module_stock ?? 0;
+            $subSubStock = $stock->sub_sub_module_stock ?? 0;
 
             $perCarton = max(1, (int) ($p->sub_module_qty ?: 1));
             $perCan    = max(1, (int) ($p->sub_sub_module_qty ?: 1));
@@ -454,15 +427,19 @@ class ProductController extends Controller
                 'price_mode_text' => $modeText,
                 'price_unit_name' => $unitName,
 
-                'module'         => ['name' => $p->module_name,         'stock' => $cartons],
-                'sub_module'     => $p->sub_module_name     ? ['name' => $p->sub_module_name,     'stock' => $cans]   : null,
-                'sub_sub_module' => $p->sub_sub_module_name ? ['name' => $p->sub_sub_module_name, 'stock' => $pieces] : null,
+                'module'         => ['name' => $p->module_name,         'stock' => $moduleStock],
+                'sub_module'     => $p->sub_module_name     ? ['name' => $p->sub_module_name,     'stock' => $subStock]   : null,
+                'sub_sub_module' => $p->sub_sub_module_name ? ['name' => $p->sub_sub_module_name, 'stock' => $subSubStock] : null,
 
                 'packaging_description' => $packaging,
                 
-                // NEW WARNING FIELDS
                 'low_stock_warning'  => (int) $p->low_stock_warning,
                 'high_stock_warning' => (int) $p->high_stock_warning,
+
+                // 🚀 NEW SELLING PRICES HERE
+                'sell_price_module'         => (float) $p->sell_price_module,
+                'sell_price_sub_module'     => (float) $p->sell_price_sub_module,
+                'sell_price_sub_sub_module' => $p->sub_sub_module_name ? (float) $p->sell_price_sub_sub_module : null,
             ];
         });
 
@@ -502,6 +479,9 @@ class ProductController extends Controller
             }
 
             $product->save();
+            
+            $this->syncProductStock($product, $addMain, $addSub, $addSub2);
+
             $product->refresh()->load('supplier');
 
             $bills = ProductPurchaseBill::whereJsonContains('product_ids', $product->id)->get();
@@ -510,6 +490,113 @@ class ProductController extends Controller
             }
         });
 
-        return response()->json($product->fresh()->load('supplier'));
+        return response()->json($product->fresh()->load(['supplier', 'currentStock']));
+    }
+
+    /* RESTOCK */
+    public function restock(Request $request, Product $product)
+    {
+        $data = $request->validate([
+            'add_module_qty'         => 'nullable|integer|min:0',
+            'add_sub_module_qty'     => 'nullable|integer|min:0',
+            'add_sub_sub_module_qty' => 'nullable|integer|min:0',
+
+            'price'           => 'required|numeric|min:0',
+            'price_mode'      => 'required|in:module,sub_module,sub_sub_module',
+            'currency'        => 'required|in:AFN,USD',
+            'exchange_rate'   => 'required|numeric|min:0.0001',
+
+            'payment_type'    => 'required|in:cash,loan_full,loan_partial',
+            'paid_amount'     => 'nullable|numeric|min:0',
+
+            'stock_entry_date' => 'nullable|string|max:20',
+            'production_date'  => 'nullable|string|max:20',
+            'expiry_date'      => 'nullable|string|max:20',
+            'note'             => 'nullable|string|max:1000',
+        ]);
+
+        $addMain = (int) ($data['add_module_qty']         ?? 0);
+        $addSub  = (int) ($data['add_sub_module_qty']     ?? 0);
+        $addSub2 = (int) ($data['add_sub_sub_module_qty'] ?? 0);
+
+        if ($addMain === 0 && $addSub === 0 && $addSub2 === 0) {
+            return response()->json(['message' => 'حداقل یک مقدار باید وارد شود'], 422);
+        }
+        if ($addSub > 0 && !$product->sub_module_name) {
+            return response()->json(['message' => 'این محصول زیر واحد ندارد'], 422);
+        }
+        if ($addSub2 > 0 && !$product->sub_sub_module_name) {
+            return response()->json(['message' => 'این محصول زیر واحد دوم ندارد'], 422);
+        }
+
+        $record = DB::transaction(function () use ($product, $data, $addMain, $addSub, $addSub2) {
+            $record = $product->restockRecords()->create([
+                'add_module_qty'         => $addMain,
+                'add_sub_module_qty'     => $addSub,
+                'add_sub_sub_module_qty' => $addSub2,
+
+                'module_name'         => $product->module_name,
+                'sub_module_name'     => $product->sub_module_name,
+                'sub_sub_module_name' => $product->sub_sub_module_name,
+                'sub_module_qty'      => $product->sub_module_qty ?: 1,
+                'sub_sub_module_qty'  => $product->sub_sub_module_qty ?: 1,
+                'price_mode'          => $data['price_mode'],
+
+                'price'         => $data['price'],
+                'currency'      => $data['currency'],
+                'exchange_rate' => $data['exchange_rate'],
+
+                'payment_type' => $data['payment_type'],
+                'paid_amount'  => $data['paid_amount'] ?? 0,
+
+                'stock_entry_date' => $data['stock_entry_date'] ?? null,
+                'production_date'  => $data['production_date'] ?? null,
+                'expiry_date'      => $data['expiry_date'] ?? null,
+                'note'             => $data['note'] ?? null,
+            ]);
+            $record->computeTotals();
+            $record->save();
+
+            if ($addMain > 0) {
+                $product->final_qty = (int) $product->final_qty + $addMain;
+            }
+            if ($addSub > 0) {
+                $product->sub_module_final_qty = (int) $product->sub_module_final_qty + $addSub;
+            }
+            if ($addSub2 > 0) {
+                $product->sub_sub_module_final_qty = (int) $product->sub_sub_module_final_qty + $addSub2;
+            }
+            if (!empty($data['stock_entry_date'])) {
+                $product->stock_entry_date = $data['stock_entry_date'];
+            }
+            $product->save();
+
+            $this->syncProductStock($product, $addMain, $addSub, $addSub2);
+
+            $product->refresh()->load('supplier');
+
+            $bills = ProductPurchaseBill::whereJsonContains('product_ids', $product->id)->get();
+            foreach ($bills as $bill) {
+                $bill->syncFromProduct($product);
+            }
+
+            return $record;
+        });
+
+        return response()->json([
+            'record'  => $record->fresh(),
+            'product' => $product->fresh()->load(['supplier', 'currentStock']),
+        ], 201);
+    }
+
+    /* RESTOCK HISTORY */
+    public function restockHistory(Product $product)
+    {
+        $records = $product->restockRecords()->get();
+
+        return response()->json([
+            'product' => $product->load(['supplier', 'currentStock']),
+            'records' => $records,
+        ]);
     }
 }

@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Product extends Model
 {
@@ -18,9 +19,8 @@ class Product extends Model
         'remaining_amount', 'remaining_amount_afn', 'remaining_amount_usd',
         'payment_type',
         'production_date', 'expiry_date', 'stock_entry_date',
-        
-        // NEW WARNING FIELDS
         'low_stock_warning', 'high_stock_warning',
+         'sell_price_module', 'sell_price_sub_module', 'sell_price_sub_sub_module',
     ];
 
     protected $casts = [
@@ -40,10 +40,11 @@ class Product extends Model
         'remaining_amount'            => 'float',
         'remaining_amount_afn'        => 'float',
         'remaining_amount_usd'        => 'float',
-        
-        // NEW WARNING CASTS
         'low_stock_warning'           => 'integer',
         'high_stock_warning'          => 'integer',
+            'sell_price_module' => 'float',
+        'sell_price_sub_module' => 'float',
+        'sell_price_sub_sub_module' => 'float',
     ];
 
     protected $appends = ['photo_url'];
@@ -53,9 +54,18 @@ class Product extends Model
         return $this->photo ? asset('storage/' . $this->photo) : null;
     }
 
+    /* =========================================================
+     | RELATIONSHIPS
+     * ========================================================= */
+
     public function supplier()
     {
         return $this->belongsTo(Supplier::class);
+    }
+
+    public function restockRecords(): HasMany
+    {
+        return $this->hasMany(ProductRestockRecord::class)->latest();
     }
 
     /* =========================================================
@@ -115,6 +125,34 @@ class Product extends Model
         return $this->setStockFromPieces(max(0, $this->totalPiecesInStock() - $pieces));
     }
 
+    /**
+     * Total stock including base product + all restock records.
+     * Base product counts as the original purchase; each restock adds on top.
+     */
+    public function getTotalStockAttribute(): array
+    {
+        $cartons = (int) $this->final_qty;
+        $cans    = (int) $this->sub_module_final_qty;
+        $pieces  = (int) $this->sub_sub_module_final_qty;
+
+        // If relation already loaded, use it (avoids extra query).
+        $records = $this->relationLoaded('restockRecords')
+            ? $this->restockRecords
+            : $this->restockRecords()->get();
+
+        foreach ($records as $r) {
+            $cartons += (int) $r->add_module_qty;
+            $cans    += (int) $r->add_sub_module_qty;
+            $pieces  += (int) $r->add_sub_sub_module_qty;
+        }
+
+        return [
+            'cartons' => $cartons,
+            'cans'    => $cans,
+            'pieces'  => $pieces,
+        ];
+    }
+
     /* =========================================================
      | PRICE HELPERS
      * ========================================================= */
@@ -167,10 +205,10 @@ class Product extends Model
     {
         $calc = $this->calculatePrice($qty);
 
-        // 👇 قیمت
+        // price
         $this->final_price = $calc['final_price'];
 
-        // 👇 موجودی — حالا هر سه فیلد درست پر میشن
+        // stock — sets all 3 fields correctly
         $this->setStockFromPieces($calc['total_pieces']);
 
         // currency conversion
@@ -216,4 +254,13 @@ class Product extends Model
         $this->save();
         return $this;
     }
+
+
+        public function currentStock()
+    {
+        return $this->hasOne(ProductStock::class);
+    }
+
+
+
 }
