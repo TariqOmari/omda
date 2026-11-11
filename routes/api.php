@@ -116,6 +116,16 @@ Route::get('/products/{product}/restocks',   [ProductController::class, 'restock
 
 use App\Http\Controllers\FixedCapitalController;
 
-use App\Http\Controllers\CashCapitalController; 
+
 Route::apiResource('fixed-capitals', FixedCapitalController::class);
 
+use App\Http\Controllers\CashCapitalController; 
+
+Route::prefix('cash-capitals')->group(function () {
+    Route::get('/',             [CashCapitalController::class, 'index']);
+    Route::post('/',            [CashCapitalController::class, 'store']);
+    Route::get('/transactions', [CashCapitalController::class, 'transactions']);
+
+    Route::get('/notifications',              [CashCapitalController::class, 'notifications']);
+    Route::put('/notifications/{id}/read',    [CashCapitalController::class, 'markNotificationRead']);
+});
