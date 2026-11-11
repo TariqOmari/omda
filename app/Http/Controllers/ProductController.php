@@ -29,6 +29,9 @@ class ProductController extends Controller
             $query->where('supplier_id', $request->supplier_id);
         }
 
+        
+
+
         if ($request->input('supplier_id') === 'null' || $request->boolean('without_supplier')) {
             $query->whereNull('supplier_id');
         }
@@ -581,6 +584,131 @@ class ProductController extends Controller
 
 
 
-   
+            /* DASHBOARD — Capital & Profit Data */
+       /* DASHBOARD — Capital & Profit Data */
+   /* DASHBOARD — Capital & Profit Data */
+/* DASHBOARD — Capital & Profit Data */
+
+public function capital()
+{
+    $products = Product::with(['currentStock'])->get();
+
+    $freezedCapitalAfn = 0;
+    $freezedCapitalUsd = 0;
+
+    foreach ($products as $product) {
+        $stock = $product->currentStock;
+
+        if (!$stock) {
+            continue;
+        }
+
+        $piecesInStock = (int) $stock->getCurrentPiecesCount();
+
+        if ($piecesInStock <= 0) {
+            continue;
+        }
+
+        $perCarton = max(1, $product->cansPerCarton());
+        $perCan = max(1, $product->piecesPerCan());
+
+        $piecesPerUnit = match ($product->price_mode) {
+            'module'         => $perCarton * $perCan,
+            'sub_module'     => $perCan,
+            'sub_sub_module' => 1,
+            default          => 1,
+        };
+
+        $costPerPiece = (float) $product->price /
+            max(1, $piecesPerUnit);
+
+        $remainingCost = $costPerPiece * $piecesInStock;
+
+        $rate = (float) ($product->exchange_rate ?: 1);
+        $currency = strtoupper($product->currency ?: 'AFN');
+
+        if ($currency === 'USD') {
+            $freezedCapitalUsd += $remainingCost;
+            $freezedCapitalAfn += $remainingCost * $rate;
+        } else {
+            $freezedCapitalAfn += $remainingCost;
+            $freezedCapitalUsd += $remainingCost / $rate;
+        }
+    }
+
+    // محاسبه سرمایه آزادشده و سود فروشات
+    $sales = \App\Models\Sale::orderBy('created_at')->get();
+
+    $totalProfitAfn = 0;
+    $totalProfitUsd = 0;
+
+    $releasedCapitalAfn = 0;
+    $releasedCapitalUsd = 0;
+
+    $runningProfit = 0;
+
+    $chartData = [
+        ['date' => 'شروع', 'profit' => 0]
+    ];
+
+    foreach ($sales as $sale) {
+        $rate = (float) ($sale->exchange_rate ?: 1);
+        $currency = strtoupper($sale->currency ?: 'AFN');
+
+        $saleProfit = (float) $sale->profit;
+        $saleCost = (float) $sale->cost_price;
+
+        // تبدیل هزینه خرید به AFN و USD
+        if ($currency === 'USD') {
+            $costAfn = $saleCost * $rate;
+            $costUsd = $saleCost;
+            $profitAfn = $saleProfit * $rate;
+            $profitUsd = $saleProfit;
+        } else {
+            $costAfn = $saleCost;
+            $costUsd = $saleCost / $rate;
+            $profitAfn = $saleProfit;
+            $profitUsd = $saleProfit / $rate;
+        }
+
+        // سرمایه آزادشده بدون سود
+        $releasedCapitalAfn += $costAfn;
+        $releasedCapitalUsd += $costUsd;
+
+        // سود فروش
+        $totalProfitAfn += $profitAfn;
+        $totalProfitUsd += $profitUsd;
+
+        $runningProfit += $profitAfn;
+
+        $chartData[] = [
+            'date' => $sale->sale_date
+                ? \Carbon\Carbon::parse($sale->sale_date)->format('M d')
+                : $sale->created_at->format('M d'),
+            'profit' => round($runningProfit, 2),
+        ];
+    }
+
+    if (count($chartData) === 1) {
+        $chartData[] = [
+            'date' => 'امروز',
+            'profit' => 0,
+        ];
+    }
+
+    return response()->json([
+        'freezed_capital_afn' => round($freezedCapitalAfn, 2),
+        'freezed_capital_usd' => round($freezedCapitalUsd, 2),
+
+        'released_capital_afn' => round($releasedCapitalAfn, 2),
+        'released_capital_usd' => round($releasedCapitalUsd, 2),
+
+        'total_profit_afn' => round($totalProfitAfn, 2),
+        'total_profit_usd' => round($totalProfitUsd, 2),
+
+        'chart_data' => $chartData,
+    ]);
+}
+
 
 }

@@ -32,6 +32,7 @@ Route::post('/products/{product}/pay', [ProductController::class, 'pay']);
 
 
 // ... existing routes ...
+Route::get('/products/capital', [ProductController::class, 'capital']);
 
 Route::apiResource('products', ProductController::class);
 
@@ -110,3 +111,11 @@ Route::post('/sale-invoices/multi', [SaleInvoiceController::class, 'storeMulti']
 // routes/api.php
 Route::post('/products/{product}/restock',   [ProductController::class, 'restock']);
 Route::get('/products/{product}/restocks',   [ProductController::class, 'restockHistory']);
+
+
+
+use App\Http\Controllers\FixedCapitalController;
+
+use App\Http\Controllers\CashCapitalController; 
+Route::apiResource('fixed-capitals', FixedCapitalController::class);
+
