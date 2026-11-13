@@ -128,4 +128,23 @@ Route::prefix('cash-capitals')->group(function () {
 
     Route::get('/notifications',              [CashCapitalController::class, 'notifications']);
     Route::put('/notifications/{id}/read',    [CashCapitalController::class, 'markNotificationRead']);
+
+
+
+
+
+
+
+
 });
+
+
+
+use App\Http\Controllers\SaleReturnController;
+
+Route::get('/sale-returns', [SaleReturnController::class, 'index']);
+Route::get('/sale-returns/{saleReturn}', [SaleReturnController::class, 'show']);
+Route::delete('/sale-returns/{saleReturn}', [SaleReturnController::class, 'destroy']);
+
+Route::post('/sales/{sale}/return/preview', [SaleReturnController::class, 'preview']);
+Route::post('/sales/{sale}/return',         [SaleReturnController::class, 'store']);

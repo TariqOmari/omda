@@ -26,6 +26,11 @@ class Sale extends Model
 
         'cost_price', 'profit',
         'note',
+
+        // 👈 RETURN TRACKING
+        'returned',
+        'returned_modules', 'returned_sub_modules', 'returned_sub_sub_modules', 'returned_pieces',
+        'total_refunded_amount', 'total_refunded_amount_afn', 'total_refunded_amount_usd',
     ];
 
     protected $casts = [
@@ -51,6 +56,16 @@ class Sale extends Model
 
         'cost_price'             => 'float',
         'profit'                 => 'float',
+
+        // 👈 RETURN TRACKING
+        'returned'                   => 'boolean',
+        'returned_modules'           => 'integer',
+        'returned_sub_modules'       => 'integer',
+        'returned_sub_sub_modules'   => 'integer',
+        'returned_pieces'            => 'integer',
+        'total_refunded_amount'      => 'float',
+        'total_refunded_amount_afn'  => 'float',
+        'total_refunded_amount_usd'  => 'float',
     ];
 
     public function customer()
@@ -61,6 +76,11 @@ class Sale extends Model
     public function product()
     {
         return $this->belongsTo(Product::class);
+    }
+
+    public function returns()
+    {
+        return $this->hasMany(SaleReturn::class);
     }
 
     public static function generateInvoiceNumber(): string

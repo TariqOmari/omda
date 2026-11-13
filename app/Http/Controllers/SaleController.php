@@ -13,7 +13,8 @@ class SaleController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Sale::with(['customer', 'product']);
+        // 👈 ADDED 'returns' to load the return history for the frontend modal
+        $query = Sale::with(['customer', 'product', 'returns']);
 
         if ($request->filled('search')) {
             $s = $request->search;
@@ -33,7 +34,8 @@ class SaleController extends Controller
 
     public function show(Sale $sale)
     {
-        return $sale->load(['customer', 'product']);
+        // 👈 Also add 'returns' here for consistency
+        return $sale->load(['customer', 'product', 'returns']);
     }
 
     public function store(Request $request)
@@ -60,10 +62,8 @@ class SaleController extends Controller
         $customer = !empty($data['customer_id']) ? Customer::find($data['customer_id']) : null;
         $stock    = ProductStock::firstOrCreate(['product_id' => $product->id]);
 
-        // 1. بررسی موجودی
         $this->checkStockAvailability($product, $stock, $data['sale_unit'], $data['qty_sold']);
 
-        // 2. محاسبات ریاضی
         $deduction = $this->calculateDeduction($product, $data['sale_unit'], $data['qty_sold']);
 
         $qty        = $data['qty_sold'];
@@ -100,7 +100,6 @@ class SaleController extends Controller
             $paid, $paidConv, $remaining, $remainingConv,
             $costPrice, $profit
         ) {
-            // 3. 👈 کم کردن از موجودی کل (به صورت دانه)
             $newPieces = $stock->sub_sub_module_stock - $deduction['pieces_used'];
             $stock->syncFromPieces($newPieces);
             $stock->save();
@@ -139,10 +138,20 @@ class SaleController extends Controller
                 'cost_price' => $costPrice,
                 'profit'     => $profit,
                 'note' => $data['note'] ?? null,
+
+                // 👈 RETURN TRACKING DEFAULTS
+                'returned'                  => false,
+                'returned_modules'          => 0,
+                'returned_sub_modules'      => 0,
+                'returned_sub_sub_modules'  => 0,
+                'returned_pieces'           => 0,
+                'total_refunded_amount'     => 0,
+                'total_refunded_amount_afn' => 0,
+                'total_refunded_amount_usd' => 0,
             ]);
         });
 
-        return response()->json($sale->load(['customer', 'product']), 201);
+        return response()->json($sale->load(['customer', 'product', 'returns']), 201);
     }
 
     public function destroy(Sale $sale)
@@ -151,10 +160,9 @@ class SaleController extends Controller
             if ($sale->product) {
                 $product = $sale->product;
                 $stock = ProductStock::firstOrCreate(['product_id' => $sale->product_id]);
-                
+
                 $deduction = $this->calculateDeduction($product, $sale->sale_unit, $sale->qty_sold);
 
-                // 👈 برگرداندن به موجودی کل (به صورت دانه)
                 $newPieces = $stock->sub_sub_module_stock + $deduction['pieces_used'];
                 $stock->syncFromPieces($newPieces);
                 $stock->save();
@@ -177,7 +185,7 @@ class SaleController extends Controller
 
         $sale->applyPayment((float) $data['amount']);
 
-        return response()->json($sale->fresh()->load(['customer', 'product']));
+        return response()->json($sale->fresh()->load(['customer', 'product', 'returns']));
     }
 
     public function preview(Request $request)
@@ -199,11 +207,10 @@ class SaleController extends Controller
         $currentSubStock    = $stock->sub_module_stock;
         $currentSubSubStock = $stock->sub_sub_module_stock;
 
-        // شبیه‌سازی موجودی بعد از فروش
         $tempStock = new ProductStock();
         $tempStock->product_id = $product->id;
         $tempStock->setRelation('product', $product);
-        
+
         $tempStock->syncFromPieces($currentSubSubStock - $deduction['pieces_used']);
 
         return response()->json([
@@ -239,7 +246,7 @@ class SaleController extends Controller
     private function checkStockAvailability(Product $product, ProductStock $stock, string $unit, int $qty): void
     {
         $deduction = $this->calculateDeduction($product, $unit, $qty);
-        
+
         if ($stock->sub_sub_module_stock < $deduction['pieces_used']) {
             abort(response()->json(['message' => "موجودی کافی نیست. موجودی فعلی: {$stock->sub_sub_module_stock} دانه"], 422));
         }
